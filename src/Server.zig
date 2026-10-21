@@ -23,8 +23,18 @@ pub fn listen(self: *Self) !void {
 
     while (true) {
         const stream = try server.accept(self.io);
-        self.client_group.async(self.io, handleClient, .{ self, stream });
+        try self.client_group.concurrent(self.io, handleClient, .{ self, stream });
     }
+}
+
+pub fn listenAsync(self: *Self) std.Io.Cancelable!void {
+    self.listen() catch |err| {
+        if (err == error.Canceled) {
+            return error.Canceled;
+        }
+
+        log.err("got error while listening: {s}", .{@errorName(err)});
+    };
 }
 
 fn handleClient(
@@ -36,7 +46,7 @@ fn handleClient(
             return std.Io.Cancelable.Canceled;
         }
 
-        log.err("{}", .{err});
+        log.err("handle client: {}", .{err});
     };
 }
 
@@ -57,7 +67,7 @@ fn _handleClient(self: *const Self, stream: std.Io.net.Stream) !void {
     while (true) {
         var req = srv.receiveHead() catch |err| {
             if (err == std.http.Server.ReceiveHeadError.HttpConnectionClosing) {
-                return;
+                break;
             }
 
             return err;
@@ -69,18 +79,33 @@ fn _handleClient(self: *const Self, stream: std.Io.net.Stream) !void {
         });
 
         switch (self.options.action) {
-            .forward => try self.forwardRequest(&req),
+            .forward => {
+                if (req.head.method == .CONNECT) {
+                    var split_it = std.mem.splitBackwardsScalar(u8, req.head.target, ':');
+                    const port = split_it.next() orelse return error.ReadTargetError;
+                    const port_num = try std.fmt.parseInt(u10, port, 10);
+                    const host: std.Io.net.HostName = try .init(split_it.rest());
+
+                    try req.respond("", .{ .status = .ok });
+
+                    _ = try self.tunnel(host, port_num, &r, &w);
+
+                    try stream.shutdown(self.io, .both);
+                    return;
+                }
+                try self.forwardRequest(&req);
+            },
             .reject => try req.respond("Rejected by proxy", .{
                 .status = .bad_gateway,
             }),
         }
     }
+
+    try stream.shutdown(self.io, .both);
 }
 
 fn forwardRequest(self: *const Self, req: *std.http.Server.Request) !void {
-    if (req.head.method == .CONNECT) {
-        return self.tunnel(req);
-    }
+    std.debug.assert(req.head.method != .CONNECT);
 
     var arena: std.heap.ArenaAllocator = .init(self.alloc);
     defer arena.deinit();
@@ -104,6 +129,7 @@ fn forwardRequest(self: *const Self, req: *std.http.Server.Request) !void {
         }
     }
 
+    // filter away H2H headers in Connection header
     var i: usize = fwd_headers.items.len;
     var cit = std.mem.tokenizeScalar(u8, connection, ',');
     while (i > 0) {
@@ -112,14 +138,21 @@ fn forwardRequest(self: *const Self, req: *std.http.Server.Request) !void {
         cit.reset();
         while (cit.next()) |_c| {
             const c = std.mem.trim(u8, _c, " ");
-            if (std.ascii.eqlIgnoreCase(fwd_headers.items[i], c)) {
-                fwd_headers.swapRemove(i);
+            if (std.ascii.eqlIgnoreCase(fwd_headers.items[i].name, c)) {
+                _ = fwd_headers.swapRemove(i);
                 break;
             }
         }
     }
 
-    if (true) @panic("TODO");
+    // clone strings to make them outlive client
+    for (fwd_headers.items) |*h| {
+        h.name = try arena.allocator().dupe(u8, h.name);
+        h.value = try arena.allocator().dupe(u8, h.value);
+    }
+
+    var reader_buf: [1024]u8 = undefined;
+    var writer_buf: [1024]u8 = undefined;
 
     var client: std.http.Client = .{
         .allocator = arena.allocator(),
@@ -127,7 +160,7 @@ fn forwardRequest(self: *const Self, req: *std.http.Server.Request) !void {
     };
     defer client.deinit();
 
-    var fwd_req = try client.request(req.head.method, req.head.target, .{
+    var fwd_req = try client.request(req.head.method, try .parse(req.head.target), .{
         .headers = .{
             .connection = .omit,
             .accept_encoding = .omit,
@@ -138,14 +171,126 @@ fn forwardRequest(self: *const Self, req: *std.http.Server.Request) !void {
         },
         .extra_headers = fwd_headers.items,
         .keep_alive = false,
+        .redirect_behavior = .unhandled,
     });
     defer fwd_req.deinit();
+
+    req.head.expect = null;
+    const req_reader = req.readerExpectNone(&reader_buf);
+
+    // streaming request body
+
+    if (req_reader.peekByte()) |_| {
+        var fwd_req_w = try fwd_req.sendBodyUnflushed(&writer_buf);
+        _ = try req_reader.streamRemaining(&fwd_req_w.writer);
+        try fwd_req_w.end();
+    } else |_| {
+        try fwd_req.sendBodiless();
+    }
+
+    // start responding
+
+    var fwd_resp = try fwd_req.receiveHead(&.{});
+
+    log.info("forwarder got {}", .{@backingInt(fwd_resp.head.status)});
+
+    fwd_headers.clearRetainingCapacity();
+    header_iter = fwd_resp.head.iterateHeaders();
+    while (header_iter.next()) |header| {
+        for (ignore_resp_headers) |h| {
+            if (std.ascii.eqlIgnoreCase(header.name, h)) {
+                break;
+            }
+        } else {
+            try fwd_headers.append(arena.allocator(), header);
+        }
+    }
+
+    var resp_w = try req.respondStreaming(&writer_buf, .{
+        .content_length = fwd_resp.head.content_length,
+        .respond_options = .{
+            .status = fwd_resp.head.status,
+            .reason = fwd_resp.head.reason,
+            .extra_headers = fwd_headers.items,
+        },
+    });
+    try resp_w.flush(); // flush now to avoid memory copies
+
+    // streaming back response
+
+    const fwd_resp_r = fwd_resp.reader(&reader_buf);
+    _ = try fwd_resp_r.streamRemaining(&resp_w.writer);
+    try resp_w.end();
 }
 
-fn tunnel(self: *const Self, req: *std.http.Server.Request) !void {
-    _ = self;
-    _ = req;
-    @panic("TODO: tunnel");
+fn tunnel(
+    self: *const Self,
+    host: std.Io.net.HostName,
+    port: u10,
+    client_r: *std.Io.net.Stream.Reader,
+    client_w: *std.Io.net.Stream.Writer,
+) !void {
+    const srv = try host.connect(self.io, port, .{
+        .mode = .stream,
+        .protocol = .tcp,
+    });
+    defer srv.close(self.io);
+
+    var server_r_buf: [1024]u8 = undefined;
+    var server_w_buf: [1024]u8 = undefined;
+
+    var server_r = srv.reader(self.io, &server_r_buf);
+    var server_w = srv.writer(self.io, &server_w_buf);
+
+    const U = union(enum) { a: std.Io.Cancelable!void };
+    var buf: [2]U = undefined;
+    var sel: std.Io.Select(U) = .init(self.io, &buf);
+    defer sel.cancelDiscard();
+
+    try sel.concurrent(.a, tunnelStream, .{ client_r, &server_w, '<' });
+    try sel.concurrent(.a, tunnelStream, .{ &server_r, client_w, '>' });
+
+    _ = try sel.await();
+    try srv.shutdown(self.io, .both);
+}
+
+fn tunnelStream(
+    r: *std.Io.net.Stream.Reader,
+    w: *std.Io.net.Stream.Writer,
+    c: u8,
+) std.Io.Cancelable!void {
+    _tunnelStream(r, w, c) catch |err| {
+        const e = switch (err) {
+            std.Io.Reader.StreamError.ReadFailed => r.err,
+            std.Io.Reader.StreamError.WriteFailed => w.err,
+            std.Io.Reader.StreamError.EndOfStream => return error.Canceled,
+        };
+        if (e) |_e| {
+            if (_e == error.Canceled) return error.Canceled;
+        }
+
+        log.err("tunneling: {c} {s} {?s}", .{
+            c,
+            @errorName(err),
+            if (e) |_e| @errorName(_e) else null,
+        });
+    };
+
+    log.debug("end {c}", .{c});
+    return std.Io.Cancelable.Canceled;
+}
+
+fn _tunnelStream(
+    r: *std.Io.net.Stream.Reader,
+    w: *std.Io.net.Stream.Writer,
+    c: u8,
+) !void {
+    _ = c;
+
+    while (true) {
+        _ = try r.interface.stream(&w.interface, .unlimited);
+        try w.interface.flush();
+    }
 }
 
 const h2h_headers: []const []const u8 = &.{
@@ -157,4 +302,9 @@ const h2h_headers: []const []const u8 = &.{
     "Trailer",
     "Transfer-Encoding",
     "Upgrade",
+};
+
+const ignore_resp_headers: []const []const u8 = &.{
+    "Transfer-Encoding",
+    "Content-Length",
 };
